@@ -11,7 +11,8 @@ Designed for both server-side Node.js applications and cron-style background job
 * **Safe Acquire/Release**: Each checked-out client gets its own error listener and a leak-detection timer, so a forgotten `release()` is surfaced instead of silently exhausting the pool.
 * **Pool Exhaustion Diagnostics**: Warns on slow acquires (`POOL ACQUIRE SLOW`), failed acquires (`POOL CONNECT FAILED`) and suspected leaks (`POOL LEAK SUSPECT`).
 * **Transaction Helpers**: `begin()` / `commit()` / `rollback()` convenience methods.
-* **Optional SQL Logging**: Emits the executed SQL and a truncated result set to `console.debug` when `debug` is enabled.
+* **Pluggable Logging**: Pass your own logger (`debug` / `info` / `warn` / `error`) to route logs into your application's logging. Without one, SQL logs go to the console when `debug` is enabled and warnings go through `process.emitWarning`.
+* **Configurable Thresholds**: The slow-acquire and leak-suspect thresholds can be tuned or disabled.
 * **DATE Type Parsing**: PostgreSQL `DATE` (OID 1082) is returned as a `YYYY-MM-DD` string instead of a timezone-dependent `Date`.
 
 #### 📦 Installation
@@ -66,6 +67,7 @@ The application reads its own environment variables and builds the `config` (inc
 `@/server/singleton/connection-pooling`
 ```typescript
 import { PgPool } from '@digitalwalletcorp/pg-pooling';
+import { appLogger } from '@/server/common/logger';
 
 let pool: PgPool | undefined;
 
@@ -81,7 +83,8 @@ export function connectionPooling(): PgPool {
       application_name: `myapp-${process.env.APP_ENV}`,
       ssl: process.env.APP_ENV === 'production' ? { rejectUnauthorized: false } : false
     }, {
-      debug: process.env.NODE_ENV !== 'production'
+      logger: appLogger, // any object with debug/info/warn/error
+      sqlLogLevel: 'info'
     });
   }
   return pool;
@@ -140,9 +143,32 @@ All other `pg.PoolConfig` properties (`host`, `port`, `database`, `user`, `passw
 
 `PgPoolOptions`:
 
-| Property | Type    | Default | Description                                                        |
-| -------- | ------- | ------- | ------------------------------------------------------------------ |
-| `debug`  | boolean | false   | When `true`, executed SQL and results are logged to `console.debug`. |
+| Property        | Type                | Default   | Description                                                                                                   |
+| --------------- | ------------------- | --------- | ------------------------------------------------------------------------------------------------------------- |
+| `logger`        | `PgPoolLogger`      | -         | Destination of all logs. When given, the logger decides which levels are output (`debug` is ignored).         |
+| `debug`         | boolean             | false     | Only used without `logger`. When `true`, `debug` / `info` logs are written to `console.debug` / `console.info`. |
+| `sqlLogLevel`   | `'debug' \| 'info'` | `'debug'` | Level used for `SQL` / `SQL RESULT` / `BEGIN` / `COMMIT` / `ROLLBACK` logs.                                    |
+| `leakWarnMs`    | number              | 60000     | Warn `POOL LEAK SUSPECT` when a client is held longer than this. `0` disables it.                            |
+| `acquireWarnMs` | number              | 1000      | Warn `POOL ACQUIRE SLOW` when acquiring takes longer than this or requests are waiting. `0` disables it.     |
+
+`PgPoolLogger`:
+
+```typescript
+interface PgPoolLogger {
+  debug(...args: any[]): void;
+  info(...args: any[]): void;
+  warn(...args: any[]): void;
+  error(...args: any[]): void;
+}
+```
+
+Each log is called with the header `'[PgPooling]'`, a message, and optional details, e.g. `logger.warn('[PgPooling]', 'POOL ACQUIRE SLOW', { elapsedMs, total, idle, waiting })`.
+
+| Level   | Messages                                                                           |
+| ------- | ---------------------------------------------------------------------------------- |
+| `debug` / `info` | `SQL`, `SQL RESULT`, `BEGIN`, `COMMIT`, `ROLLBACK` (chosen by `sqlLogLevel`) |
+| `warn`  | `POOL ACQUIRE SLOW`, `POOL LEAK SUSPECT`, `POOL RELEASE (after leak suspect)`      |
+| `error` | `POOL CONNECT FAILED`, `Idle client error`, `Checked-out client error`             |
 
 ##### `PgPool` Methods
 
@@ -167,7 +193,7 @@ All other `pg.PoolConfig` properties (`host`, `port`, `database`, `user`, `passw
 
 * Always release clients back to the pool using `release()` to avoid connection leaks.
 * Use `connect()` and `release()` inside `try/finally` blocks for safe resource management.
-* Warnings (slow acquire, connect failure, leak suspect, idle/checked-out client errors) are emitted via `process.emitWarning`. To suppress them, run Node with the `--no-warnings` flag (e.g. `node --no-warnings app.js`, or `NODE_OPTIONS=--no-warnings`).
+* Without `logger`, `warn` / `error` logs are emitted via `process.emitWarning` so that callers can suppress them with the `--no-warnings` flag (e.g. `node --no-warnings app.js`, or `NODE_OPTIONS=--no-warnings`) or handle them with `process.on('warning')`.
 
 #### 📜 License
 

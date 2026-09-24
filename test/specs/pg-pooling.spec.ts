@@ -258,4 +258,155 @@ describe('pg-pooling', () => {
       }
     });
   });
+
+  describe('logging', () => {
+    const createLogger = () => ({
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn()
+    });
+
+    it('default logger does not output SQL to console when debug is false', async () => {
+      const debugSpy = jest.spyOn(console, 'debug').mockImplementation(() => undefined);
+      try {
+        const pool = new PgPool(baseConfig);
+        const client = await pool.connect();
+        await client.query('SELECT 1');
+        client.release();
+        expect(debugSpy).not.toHaveBeenCalled();
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+
+    it('default logger outputs SQL to console.debug when debug is true', async () => {
+      const debugSpy = jest.spyOn(console, 'debug').mockImplementation(() => undefined);
+      try {
+        const pool = new PgPool(baseConfig, { debug: true });
+        const client = await pool.connect();
+        await client.query('SELECT 1');
+        client.release();
+        expect(debugSpy).toHaveBeenCalledWith('[PgPooling]', 'SQL', 'SELECT 1', undefined);
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+
+    it('default logger outputs SQL to console.info when sqlLogLevel is info', async () => {
+      const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => undefined);
+      try {
+        const pool = new PgPool(baseConfig, { debug: true, sqlLogLevel: 'info' });
+        const client = await pool.connect();
+        await client.begin();
+        client.release();
+        expect(infoSpy).toHaveBeenCalledWith('[PgPooling]', 'BEGIN');
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+
+    it('injected logger receives SQL at debug level regardless of the debug flag', async () => {
+      const logger = createLogger();
+      const pool = new PgPool(baseConfig, { logger });
+      const client = await pool.connect();
+      await client.query('SELECT 1');
+      client.release();
+      expect(logger.debug).toHaveBeenCalledWith('[PgPooling]', 'SQL', 'SELECT 1', undefined);
+      expect(logger.debug).toHaveBeenCalledWith('[PgPooling]', 'SQL RESULT', expect.objectContaining({ command: 'SELECT' }));
+      expect(logger.info).not.toHaveBeenCalled();
+    });
+
+    it('injected logger receives SQL at info level when sqlLogLevel is info', async () => {
+      const logger = createLogger();
+      const pool = new PgPool(baseConfig, { logger, sqlLogLevel: 'info' });
+      const client = await pool.connect();
+      await client.query('SELECT 1');
+      client.release();
+      expect(logger.info).toHaveBeenCalledWith('[PgPooling]', 'SQL', 'SELECT 1', undefined);
+      expect(logger.debug).not.toHaveBeenCalled();
+    });
+
+    it('suppressLog skips SQL logging', async () => {
+      const logger = createLogger();
+      const pool = new PgPool(baseConfig, { logger });
+      const client = await pool.connect();
+      await client.query('SELECT 1', [], { suppressLog: true });
+      client.release();
+      expect(logger.debug).not.toHaveBeenCalled();
+    });
+
+    it('injected logger receives warnings and errors instead of process.emitWarning', async () => {
+      const logger = createLogger();
+      const pool = new PgPool(baseConfig, { logger });
+      const instance = pgMock.default.Pool.instances[0];
+      instance.waitingCount = 1;
+      const client = await pool.connect();
+      client.release();
+      expect(logger.warn).toHaveBeenCalledWith('[PgPooling]', 'POOL ACQUIRE SLOW', expect.objectContaining({ waiting: 1 }));
+
+      const error = new Error('pool exhausted');
+      instance.connectImpl = async () => {
+        throw error;
+      };
+      await expect(pool.connect()).rejects.toThrow('pool exhausted');
+      expect(logger.error).toHaveBeenCalledWith('[PgPooling]', 'POOL CONNECT FAILED', expect.any(Object), error);
+
+      const idleError = new Error('idle boom');
+      instance.emit('error', idleError);
+      expect(logger.error).toHaveBeenCalledWith('[PgPooling]', 'Idle client error', idleError);
+      expect(emitWarningSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('thresholds', () => {
+    const useRawClient = () => {
+      let raw: any;
+      pgMock.default.Pool.instances[0].connectImpl = async () => {
+        const { EventEmitter } = require('events');
+        raw = new EventEmitter();
+        raw.query = jest.fn();
+        raw.release = jest.fn();
+        return raw;
+      };
+    };
+
+    it('leakWarnMs overrides the leak threshold', async () => {
+      jest.useFakeTimers();
+      try {
+        const pool = new PgPool(baseConfig, { leakWarnMs: 1000 });
+        useRawClient();
+        const client = await pool.connect();
+        jest.advanceTimersByTime(999);
+        expect(emitWarningSpy).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(emitWarningSpy).toHaveBeenCalledWith(expect.stringContaining('POOL LEAK SUSPECT'));
+        client.release();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('leakWarnMs 0 disables leak detection', async () => {
+      jest.useFakeTimers();
+      try {
+        const pool = new PgPool(baseConfig, { leakWarnMs: 0 });
+        useRawClient();
+        const client = await pool.connect();
+        jest.advanceTimersByTime(60 * 60 * 1000);
+        client.release();
+        expect(emitWarningSpy).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('acquireWarnMs 0 disables the slow acquire warning', async () => {
+      const pool = new PgPool(baseConfig, { acquireWarnMs: 0 });
+      pgMock.default.Pool.instances[0].waitingCount = 1;
+      const client = await pool.connect();
+      client.release();
+      expect(emitWarningSpy).not.toHaveBeenCalled();
+    });
+  });
 });
