@@ -6,8 +6,37 @@ import util from 'util';
 // SQLの段階でカラムを指定してセレクトできる場合は`SELECT xx_date::TEXT`のように記述すればSQLレベルでYYYY-MM-DD文字列に変換される
 pg.types.setTypeParser(1082, (v) => v);
 
+/**
+ * ログの出力先
+ * 渡した場合、どのレベルを出力するかはこのロガーが決める
+ */
+export interface PgPoolLogger {
+  debug(...args: any[]): void;
+  info(...args: any[]): void;
+  warn(...args: any[]): void;
+  error(...args: any[]): void;
+}
+
 export interface PgPoolOptions {
+  /** ログの出力先。未指定の場合はconsole(debug/info)とprocess.emitWarning(warn/error)に出力する */
+  logger?: PgPoolLogger;
+  /** loggerを渡さない場合のみ有効。trueの場合はdebug/infoも出力する */
   debug?: boolean;
+  /** SQL/SQL RESULT/BEGIN/COMMIT/ROLLBACKを出力するレベル */
+  sqlLogLevel?: 'debug' | 'info';
+  /** 接続の保持がこの時間を超えた場合にリーク疑いとして警告する。0の場合は警告しない */
+  leakWarnMs?: number;
+  /** 接続の取得がこの時間を超えた場合に警告する。0の場合は警告しない */
+  acquireWarnMs?: number;
+}
+
+/**
+ * PgClientの動作設定。PgPoolOptionsの既定値を解決したもの
+ */
+export interface PgClientSettings {
+  logger: PgPoolLogger;
+  sqlLogLevel: 'debug' | 'info';
+  leakWarnMs: number;
 }
 
 const logHeader = '[PgPooling]';
@@ -21,17 +50,49 @@ const DEFAULT_KEEP_ALIVE = true;
 const DEFAULT_KEEP_ALIVE_INITIAL_DELAY_MS = 10 * 1000;
 
 // 接続の取得がこの時間を超えた場合に警告する。正常時の取得は新規接続の確立を含めても数百msで収まる
-const ACQUIRE_WARN_MS = 1000;
+const DEFAULT_ACQUIRE_WARN_MS = 1000;
 // 接続の保持がこの時間を超えた場合にリーク疑いとして警告する。
 // 1クエリの上限(statement_timeout/query_timeout)より長く、サーバ側が放置セッションを切断するidle_in_transaction_session_timeoutと同じ長さ
-const LEAK_WARN_MS = 60 * 1000;
+const DEFAULT_LEAK_WARN_MS = 60 * 1000;
+
+/**
+ * loggerが渡されなかった場合のロガー
+ * 警告とエラーは呼び出し元が--no-warningsやprocess.on('warning')で抑止・捕捉できるようにprocess.emitWarningで出力する
+ *
+ * @param {boolean} debug trueの場合はdebug/infoもconsoleに出力する
+ * @returns {PgPoolLogger}
+ */
+function createDefaultLogger(debug: boolean): PgPoolLogger {
+  return {
+    debug: (...args: any[]) => {
+      if (debug) {
+        console.debug(...args);
+      }
+    },
+    info: (...args: any[]) => {
+      if (debug) {
+        console.info(...args);
+      }
+    },
+    warn: (...args: any[]) => process.emitWarning(util.format(...args)),
+    error: (...args: any[]) => process.emitWarning(util.format(...args))
+  };
+}
 
 export class PgPool {
   private pool: pg.Pool;
-  private readonly debug: boolean;
+  private readonly logger: PgPoolLogger;
+  private readonly acquireWarnMs: number;
+  private readonly clientSettings: PgClientSettings;
 
   constructor(config: pg.PoolConfig, options?: PgPoolOptions) {
-    this.debug = options?.debug ?? false;
+    this.logger = options?.logger ?? createDefaultLogger(options?.debug ?? false);
+    this.acquireWarnMs = options?.acquireWarnMs ?? DEFAULT_ACQUIRE_WARN_MS;
+    this.clientSettings = {
+      logger: this.logger,
+      sqlLogLevel: options?.sqlLogLevel ?? 'debug',
+      leakWarnMs: options?.leakWarnMs ?? DEFAULT_LEAK_WARN_MS
+    };
     // 各種タイムアウトの既定値を適用する。configで指定された項目はそのまま優先する
     const mergedConfig: pg.PoolConfig = {
       connectionTimeoutMillis: DEFAULT_CONNECTION_TIMEOUT_MS,
@@ -46,7 +107,7 @@ export class PgPool {
     this.pool.on('error', (error: Error) => {
       // アイドル接続のエラーはプールに通知する
       // リスナーが無いとプロセスが落ちるため必ず登録する
-      process.emitWarning(`${logHeader} Idle client error. ${error.message}`);
+      this.logger.error(logHeader, 'Idle client error', error);
     });
   }
 
@@ -61,13 +122,16 @@ export class PgPool {
       const elapsedMs = Date.now() - start;
       const stats = this.poolStats();
       // 取得に時間がかかった、あるいは取得待ちの要求が滞留している場合はプール枯渇の前兆として警告する
-      if (ACQUIRE_WARN_MS <= elapsedMs || 0 < stats.waiting) {
-        process.emitWarning(`${logHeader} POOL ACQUIRE SLOW. ${JSON.stringify({ elapsedMs, ...stats })}`);
+      if (0 < this.acquireWarnMs && (this.acquireWarnMs <= elapsedMs || 0 < stats.waiting)) {
+        this.logger.warn(logHeader, 'POOL ACQUIRE SLOW', { elapsedMs, ...stats });
       }
-      return new PgClient(client, this.debug);
+      return new PgClient(client, this.clientSettings);
     } catch (error) {
       // connectionTimeoutMillisによる取得失敗を無言にしない
-      process.emitWarning(`${logHeader} POOL CONNECT FAILED. ${JSON.stringify({ elapsedMs: Date.now() - start, ...this.poolStats() })} ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.error(logHeader, 'POOL CONNECT FAILED', {
+        elapsedMs: Date.now() - start,
+        ...this.poolStats()
+      }, error);
       throw error;
     }
   }
@@ -104,39 +168,44 @@ export class PgPool {
 
 export class PgClient {
   private client: pg.PoolClient;
-  private readonly debug: boolean;
+  private readonly settings: PgClientSettings;
   private acquiredAt = Date.now();
-  private leakTimer: ReturnType<typeof setTimeout>;
+  private leakTimer: ReturnType<typeof setTimeout> | undefined;
   private leakWarned = false;
   // 貸出中のクライアントに個別のエラーリスナーを設定
   // これが無いとDB側の瞬断でリスナー不在のerrorイベントが発生し、プロセスが落ちる
   private errorListener = (error: Error) => {
-    process.emitWarning(`${logHeader} Checked-out client error. ${error.message}`);
+    this.settings.logger.error(logHeader, 'Checked-out client error', error);
   };
 
-  constructor(client: pg.PoolClient, debug = false) {
+  constructor(client: pg.PoolClient, settings: PgClientSettings) {
     this.client = client;
-    this.debug = debug;
+    this.settings = settings;
     this.client.on('error', this.errorListener);
-    // リークした接続の取得元を特定できるように、取得時点のスタックトレースを保持する
-    const acquireStack = new Error('acquired here').stack;
-    this.leakTimer = setTimeout(() => {
-      this.leakWarned = true;
-      process.emitWarning(`${logHeader} POOL LEAK SUSPECT. ${JSON.stringify({ heldMs: Date.now() - this.acquiredAt })}\n${acquireStack}`);
-    }, LEAK_WARN_MS);
-    // タイマーが残っていてもプロセスの終了を妨げないようにする
-    this.leakTimer.unref();
+    if (0 < settings.leakWarnMs) {
+      // リークした接続の取得元を特定できるように、取得時点のスタックトレースを保持する
+      const acquireStack = new Error('acquired here').stack;
+      this.leakTimer = setTimeout(() => {
+        this.leakWarned = true;
+        settings.logger.warn(logHeader, 'POOL LEAK SUSPECT', {
+          heldMs: Date.now() - this.acquiredAt,
+          acquireStack
+        });
+      }, settings.leakWarnMs);
+      // タイマーが残っていてもプロセスの終了を妨げないようにする
+      this.leakTimer.unref();
+    }
   }
 
   public async query<R extends pg.QueryResult = pg.QueryResult>(text: string, values?: any[], options?: {
     suppressLog?: boolean
   }): Promise<R> {
     if (!options?.suppressLog) {
-      this.debugLog(logHeader, 'SQL', text, values);
+      this.sqlLog(logHeader, 'SQL', text, values);
     }
     const result = await this.client.query(text, values);
     if (!options?.suppressLog) {
-      this.debugLog(logHeader, 'SQL RESULT', {
+      this.sqlLog(logHeader, 'SQL RESULT', {
         command: result.command,
         rowCount: result.rowCount,
         rows: Array.isArray(result.rows)
@@ -151,7 +220,7 @@ export class PgClient {
     clearTimeout(this.leakTimer);
     if (this.leakWarned) {
       // リーク疑い警告後に返却されたことを記録する。警告後にこのログが無ければ本物のリークと判断できる
-      process.emitWarning(`${logHeader} POOL RELEASE (after leak suspect). ${JSON.stringify({ heldMs: Date.now() - this.acquiredAt })}`);
+      this.settings.logger.warn(logHeader, 'POOL RELEASE (after leak suspect)', { heldMs: Date.now() - this.acquiredAt });
     }
     // 返却後はプール側のリスナー(pool.on('error'))が受け持つ
     this.client.removeListener('error', this.errorListener);
@@ -159,23 +228,21 @@ export class PgClient {
   }
 
   public async begin(): Promise<pg.QueryResult> {
-    this.debugLog(logHeader, 'BEGIN');
+    this.sqlLog(logHeader, 'BEGIN');
     return this.client.query('BEGIN');
   }
 
   public async commit(): Promise<pg.QueryResult> {
-    this.debugLog(logHeader, 'COMMIT');
+    this.sqlLog(logHeader, 'COMMIT');
     return this.client.query('COMMIT');
   }
 
   public async rollback(): Promise<pg.QueryResult> {
-    this.debugLog(logHeader, 'ROLLBACK');
+    this.sqlLog(logHeader, 'ROLLBACK');
     return this.client.query('ROLLBACK');
   }
 
-  private debugLog(...args: any[]): void {
-    if (this.debug) {
-      console.debug(...args);
-    }
+  private sqlLog(...args: any[]): void {
+    this.settings.logger[this.settings.sqlLogLevel](...args);
   }
 }
