@@ -1,0 +1,51 @@
+{
+  "name": "@digitalwalletcorp/pg-pooling",
+  "version": "0.1.0",
+  "description": "This is a library for PostgreSQL connection pooling",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "install:dev": "rm -rf lib dest && find node_modules -mindepth 1 -delete && yarn install",
+    "version:patch": "npm version patch",
+    "version:minor": "npm version minor",
+    "version:major": "npm version major",
+    "prepack": "rm -rf lib && npm run build",
+    "pack": "rm -rf dest && mkdir -p dest && npm pack --pack-destination=dest",
+    "publish:npm": "bash ../bin/publish.sh",
+    "test:unit": "NODE_OPTIONS=--max-old-space-size=2048 npx jest --runInBand --logHeapUsage --detectOpenHandles --forceExit --errorOnDeprecated --coverage --silent --unhandled-rejections=strict"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "pg",
+    "pooling"
+  ],
+  "author": "satoshi kotaki",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/digitalwalletcorp/pg-pooling.git"
+  },
+  "homepage": "https://github.com/digitalwalletcorp/pg-pooling",
+  "bugs": {
+    "url": "https://github.com/digitalwalletcorp/pg-pooling/issues"
+  },
+  "files": [
+    "lib/**/*",
+    "src/**/*"
+  ],
+  "peerDependencies": {
+    "pg": ">=8.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/pg": "^8.16.0",
+    "jest": "^30.3.0",
+    "pg": "^8.16.3",
+    "ts-jest": "^29.4.9",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^6.0.3"
+  }
+}
