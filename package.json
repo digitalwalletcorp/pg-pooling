@@ -1,6 +1,6 @@
 {
   "name": "@digitalwalletcorp/pg-pooling",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "This is a library for PostgreSQL connection pooling",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -46,6 +46,6 @@
     "ts-jest": "^29.4.9",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
-    "typescript": "^6.0.3"
+    "typescript": "6.0.3"
   }
 }
